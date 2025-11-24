@@ -1,0 +1,195 @@
+import os
+import cv2
+import numpy as np
+import pandas as pd
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.preprocessing import image
+import tensorflow as tf
+import joblib
+
+# --- Configuration & Paths ---
+# Note: Adjust these paths if running locally instead of Kaggle
+data_dir = '/kaggle/input/real-time-anomaly-detection-in-cctv-surveillance/'
+video_dir = os.path.join(data_dir, 'data')
+train_csv = os.path.join(video_dir, 'train.csv')
+test_csv = os.path.join(video_dir, 'test.csv')
+
+# Verify paths
+print("Dataset root contents:", os.listdir(data_dir))
+if os.path.exists(video_dir):
+    print("Video dir contents:", os.listdir(video_dir))
+print(f"Train CSV path: {train_csv}, Exists: {os.path.exists(train_csv)}")
+print(f"Test CSV path: {test_csv}, Exists: {os.path.exists(test_csv)}")
+
+# Define threat vs. normal classes
+threat_classes = ['abuse', 'arrest', 'arson', 'assault', 'burglary', 'explosion', 
+                  'fighting', 'roadaccidents', 'robbery', 'shooting', 'shoplifting', 
+                  'stealing', 'vandalism']
+normal_class = ['normal']
+
+# --- Helper Functions ---
+
+def extract_frames(video_path, num_frames=5):
+    """Extracts a specified number of frames from a video file."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Failed to open video: {video_path}")
+        return []
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, total_frames // num_frames)
+    frames = []
+    
+    for i in range(0, total_frames, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if ret:
+            frames.append(cv2.resize(frame, (224, 224)))
+        if len(frames) >= num_frames: 
+            break
+            
+    cap.release()
+    return frames
+
+# Initialize ResNet50 for feature extraction
+model = ResNet50(weights='imagenet', include_top=False, pooling='avg')
+
+def extract_cnn_features(frames):
+    """Passes frames through ResNet50 and averages the features."""
+    if not frames:
+        return None
+    
+    features = []
+    for frame in frames:
+        frame_array = image.img_to_array(frame)
+        frame_array = np.expand_dims(frame_array, axis=0)
+        frame_array = tf.keras.applications.resnet50.preprocess_input(frame_array)
+        feat = model.predict(frame_array, verbose=0)
+        features.append(feat.flatten())
+        
+    return np.mean(features, axis=0)
+
+# --- Data Loading & Processing (Training) ---
+
+train_df = pd.read_csv(train_csv)
+print("Train CSV columns:", train_df.columns)
+
+X_train, y_train = [], []
+
+print("Processing training data...")
+for index, row in train_df.iterrows():
+    # Adjust path formatting
+    relative_path = row['video_name'].replace('\n', '').replace('\\', '/')
+    video_path = os.path.join(data_dir, relative_path)
+    
+    # Label encoding: 1 for Threat, 0 for Normal
+    label = 1 if row['label'] in threat_classes else (0 if row['label'] in normal_class else -1)
+    
+    if label == -1: continue
+    
+    frames = extract_frames(video_path)
+    if frames:
+        features = extract_cnn_features(frames)
+        if features is not None:
+            X_train.append(features)
+            y_train.append(label)
+
+X_train = np.array(X_train)
+y_train = np.array(y_train)
+print(f"Train data shape: {X_train.shape}, Train labels shape: {y_train.shape}")
+
+if X_train.shape[0] == 0:
+    raise ValueError("No training data loaded. Check train.csv and video files.")
+
+# --- Model Training ---
+
+print("Training SVM model...")
+svm_model = SVC(kernel='rbf', C=1.0, gamma='scale')
+svm_model.fit(X_train, y_train)
+
+# --- Data Loading & Processing (Testing) ---
+
+test_df = pd.read_csv(test_csv)
+X_test, y_test = [], []
+
+print("Processing test data...")
+for index, row in test_df.iterrows():
+    relative_path = row['video_name'].replace('\n', '').replace('\\', '/')
+    video_path = os.path.join(data_dir, relative_path)
+    
+    label = 1 if row['label'] in threat_classes else (0 if row['label'] in normal_class else -1)
+    
+    if label == -1: continue
+    
+    frames = extract_frames(video_path)
+    if frames:
+        features = extract_cnn_features(frames)
+        if features is not None:
+            X_test.append(features)
+            y_test.append(label)
+
+X_test = np.array(X_test)
+y_test = np.array(y_test)
+print(f"Test data shape: {X_test.shape}, Test labels shape: {y_test.shape}")
+
+# --- Evaluation ---
+
+# Simulate real-time analysis with a test video (Buffer Logic)
+test_video = os.path.join(video_dir, 'Abuse001_x264.mp4') 
+if os.path.exists(test_video):
+    cap = cv2.VideoCapture(test_video)
+    frame_buffer = []
+    print(f"Running buffer simulation on {test_video}...")
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+        
+        frame_resized = cv2.resize(frame, (224, 224))
+        frame_buffer.append(frame_resized)
+        
+        # Maintain buffer size
+        if len(frame_buffer) > 5:
+            frame_buffer.pop(0)
+            
+        # Predict when buffer is full
+        if len(frame_buffer) == 5:
+            features = extract_cnn_features(frame_buffer)
+            if features is not None:
+                prediction = svm_model.predict([features])[0]
+                label = "Threat" if prediction == 1 else "Normal"
+                print(f"Buffer Prediction: {label}")
+                # Break after first prediction for brevity in this script
+                break 
+    cap.release()
+
+# Calculate Overall Accuracy
+y_pred = svm_model.predict(X_test)
+print("Accuracy of the model in percentage:", accuracy_score(y_test, y_pred) * 100)
+
+# --- Single Instance Inference Examples ---
+
+# Test 1: Abuse Video
+test_video_1 = os.path.join(video_dir, 'abuse/Abuse001_x264.mp4')
+if os.path.exists(test_video_1):
+    frames = extract_frames(test_video_1) 
+    features = extract_cnn_features(frames)
+    prediction = svm_model.predict([features])[0]
+    label = "Threat" if prediction == 1 else "Normal"
+    print(f"Video 1 ({test_video_1}) Prediction: {label}")
+
+# Test 2: Normal Video
+test_video_2 = os.path.join(video_dir, 'normal/Normal_Videos001_x264.mp4')
+if os.path.exists(test_video_2):
+    frames = extract_frames(test_video_2) 
+    features = extract_cnn_features(frames)
+    prediction = svm_model.predict([features])[0]
+    label = "Threat" if prediction == 1 else "Normal"
+    print(f"Video 2 ({test_video_2}) Prediction: {label}")
+
+# --- Save Model ---
+
+save_path = '/kaggle/working/svm_model.pkl'
+joblib.dump(svm_model, save_path)
+print(f"Model saved to {save_path}")
